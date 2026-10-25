@@ -1,0 +1,149 @@
+# Publishes com.botwithus:msgpack into BotWithUs/maven, a static Maven
+# repository served over GitHub Pages at https://botwithus.github.io/maven/.
+# Static means the tree is exactly what Gradle wrote, so it resolves
+# anonymously, with no token needed to read a public artifact.
+#
+# Cut a release by tagging: `git tag v0.1.0 && git push origin v0.1.0`.
+#
+# Setup (an admin, once): this needs a repository secret MAVEN_DEPLOY_KEY, the
+# private half of a write-enabled deploy key added to BotWithUs/maven and
+# scoped to that repository alone. Until it exists the checkout of
+# BotWithUs/maven fails and nothing is published.
+name: Publish msgpack
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, without the leading v (e.g. 0.1.0)'
+        required: true
+        type: string
+
+# contents: write is needed to create the GitHub release. The push to
+# BotWithUs/maven uses the deploy key, not this token.
+permissions:
+  contents: write
+
+# Two publishes racing would both push to BotWithUs/maven and one would be
+# rejected non-fast-forward, so serialise them.
+concurrency:
+  group: publish-msgpack
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Resolve the release version
+        id: release
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$version' is not a semantic version. Tag releases as v1.2.3."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Checked out BEFORE the publish so Gradle writes into this working copy:
+      # it merges maven-metadata.xml against the versions already published
+      # instead of replacing the version list with just this release.
+      - name: Check out the Maven repository
+        uses: actions/checkout@v4
+        with:
+          repository: BotWithUs/maven
+          ssh-key: ${{ secrets.MAVEN_DEPLOY_KEY }}
+          path: maven
+
+      - name: Refuse to overwrite a published version
+        run: |
+          dest="maven/com/botwithus/msgpack/${{ steps.release.outputs.version }}"
+          if [ -d "$dest" ]; then
+            echo "::error::msgpack ${{ steps.release.outputs.version }} is already published. Published versions are immutable, so cut a new one."
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # `build` first, so a release is only ever cut from a tree whose tests pass.
+      - name: Build, test and publish into the repository working copy
+        working-directory: source
+        run: |
+          chmod +x gradlew
+          ./gradlew build publishMavenJavaPublicationToStaticTreeRepository \
+            "-PreleaseVersion=${{ steps.release.outputs.version }}" \
+            "-PmavenRepoDir=${{ github.workspace }}/maven"
+
+      - name: Commit and push
+        working-directory: maven
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .
+          if git diff --cached --quiet; then
+            echo "::error::The publish produced no new files."
+            exit 1
+          fi
+          git commit -m "msgpack ${{ steps.release.outputs.version }}"
+          git push
+
+      # Only on a tag: a workflow_dispatch run has no tag to hang a release off.
+      # --repo is required because the workspace root (where `maven/` lives) has
+      # no .git of its own, so `gh` cannot infer the repository.
+      - name: Create the GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ steps.release.outputs.version }}"
+          cat > notes.md <<NOTES
+          \`com.botwithus:msgpack:$version\` is published to the
+          [BotWithUs Maven repository](https://botwithus.github.io/maven).
+
+          \`\`\`kotlin
+          repositories {
+              mavenCentral()
+              maven { url = uri("https://botwithus.github.io/maven") }
+          }
+
+          dependencies {
+              implementation("com.botwithus:msgpack:$version")
+          }
+          \`\`\`
+          NOTES
+          gh release create "v$version" \
+            --repo "${{ github.repository }}" \
+            --title "msgpack $version" \
+            --notes-file notes.md \
+            --generate-notes \
+            --verify-tag \
+            maven/com/botwithus/msgpack/"$version"/*.jar
+
+      - name: Summarise
+        run: |
+          version="${{ steps.release.outputs.version }}"
+          {
+            echo "### msgpack $version published"
+            echo
+            echo '```kotlin'
+            echo 'dependencies {'
+            echo "    implementation(\"com.botwithus:msgpack:$version\")"
+            echo '}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
